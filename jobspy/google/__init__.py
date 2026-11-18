@@ -4,6 +4,7 @@ import json
 import math
 import re
 from datetime import datetime, timedelta
+from threading import Event
 from typing import Any
 
 from jobspy.google.constant import async_param, headers_initial, headers_jobs
@@ -12,6 +13,7 @@ from jobspy.model import (
     JobPost,
     JobType,
     Location,
+    PageStream,
     Scraper,
     ScraperInput,
 )
@@ -27,48 +29,58 @@ class Google(Scraper):
         self.url = "https://www.google.com/search"
         self.jobs_url = "https://www.google.com/async/callback:550"
 
-    def scrape(self, scraper_input: ScraperInput) -> list[JobPost]:
+    def iter_pages(
+        self, scraper_input: ScraperInput, stop: Event | None = None
+    ) -> PageStream:
         """
-        Scrapes Google for jobs with scraper_input criteria.
+        Scrapes Google for jobs with scraper_input criteria, one page at a time.
         :param scraper_input: Information about job search criteria.
-        :return: a list of jobs.
+        :param stop: set to stop paginating.
         """
         self.scraper_input = scraper_input
-        self.scraper_input.results_wanted = min(900, scraper_input.results_wanted)
-
+        wanted = min(900, scraper_input.results_wanted)
         self.session = create_session(
             RequestsRotating(scraper_input.proxies), scraper_input
         )
         try:
-            forward_cursor, job_list = self._get_initial_cursor_and_jobs()
-        except Exception as e:
-            self.fail(str(e))
-            return []
-        if forward_cursor is None:
-            return job_list
-
-        page = 1
-
-        while (
-            len(self.seen_urls) < scraper_input.results_wanted + scraper_input.offset
-            and forward_cursor
-        ):
-            self.log.info(
-                f"search page: {page} / {math.ceil(scraper_input.results_wanted / self.jobs_per_page)}"
-            )
             try:
-                jobs, forward_cursor = self._get_jobs_next_page(forward_cursor)
+                forward_cursor, jobs = self._get_initial_cursor_and_jobs()
             except Exception as e:
                 self.fail(str(e))
-                break
-            if not jobs:
-                self.log.info(f"found no jobs on page: {page}")
-                break
-            job_list += jobs
-            page += 1
-        return job_list[
-            scraper_input.offset : scraper_input.offset + scraper_input.results_wanted
-        ]
+                self._finish(0, wanted)
+                return
+
+            total = 0
+            skip = scraper_input.offset
+            page = 1
+            while True:
+                if skip:
+                    skipped = min(skip, len(jobs))
+                    jobs = jobs[skipped:]
+                    skip -= skipped
+                room = wanted - total
+                if len(jobs) > room:
+                    jobs = jobs[:room]
+                total += len(jobs)
+                if jobs:
+                    yield jobs
+                if total >= wanted or not forward_cursor:
+                    break
+                self.log.info(
+                    f"search page: {page} / {math.ceil(wanted / self.jobs_per_page)}"
+                )
+                try:
+                    jobs, forward_cursor = self._get_jobs_next_page(forward_cursor)
+                except Exception as e:
+                    self.fail(str(e))
+                    break
+                if not jobs:
+                    self.log.info(f"found no jobs on page: {page}")
+                    break
+                page += 1
+            self._finish(total, wanted)
+        finally:
+            self.session.close()
 
     def _get_initial_cursor_and_jobs(self) -> tuple[str | None, list[JobPost]]:
         """Gets initial cursor and jobs to paginate through job listings"""

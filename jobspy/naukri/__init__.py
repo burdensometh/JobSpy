@@ -3,8 +3,8 @@ from __future__ import annotations
 import math
 import random
 import re
-import time
 from datetime import datetime
+from threading import Event
 
 from jobspy.model import (
     Compensation,
@@ -13,6 +13,7 @@ from jobspy.model import (
     JobPost,
     JobType,
     Location,
+    PageStream,
     Scraper,
     ScraperInput,
 )
@@ -44,66 +45,76 @@ class Naukri(Scraper):
     job_page_url = f"{base_url}/jobapi/v4/job"
     delay = (3, 7)
 
-    def scrape(self, scraper_input: ScraperInput) -> list[JobPost]:
+    def iter_pages(
+        self, scraper_input: ScraperInput, stop: Event | None = None
+    ) -> PageStream:
         self.scraper_input = scraper_input
         self.session = create_session(TLSRotating(scraper_input.proxies), scraper_input)
-        params = self._search_params()
-        job_list: list[JobPost] = []
-        seen: set[object] = set()
-        first_page = page = scraper_input.offset // jobs_per_page + 1
-        skip = scraper_input.offset % jobs_per_page
+        try:
+            params = self._search_params()
+            total = 0
+            seen: set[object] = set()
+            first_page = page = scraper_input.offset // jobs_per_page + 1
+            skip = scraper_input.offset % jobs_per_page
 
-        while len(job_list) < scraper_input.results_wanted:
-            if page > first_page:
-                time.sleep(random.uniform(*self.delay))
-            self.log.info(f"search page: {page}")
-            try:
-                response = self.session.get(
-                    self.search_url,
-                    params=params | {"pageNo": page},
-                    headers=headers | {"nkparam": generate_nkparam("srp")},
-                )
-                if response.status_code == 400 and page > 1:
-                    break  # past the last page
-                if response.status_code == 406:
-                    self.fail(
-                        "response status code 406 (recaptcha required): "
-                        "the address is rate limited, or the request token was "
-                        "rejected (the public key in jobspy/naukri/constant.py "
-                        "may be out of date)"
-                    )
+            while total < scraper_input.results_wanted:
+                if page > first_page and self._interrupted(
+                    stop, random.uniform(*self.delay)
+                ):
                     break
-                check_status(response)
-                result = JobSearch.model_validate(response.json())
-                jobs = result.jobDetails or []
-                last_page = math.ceil(result.noOfJobs / jobs_per_page)
-                new_jobs = [job for job in jobs if job.get("jobId") not in seen]
-                seen.update(job.get("jobId") for job in jobs)
-            except Exception as e:
-                self.fail(str(e))
-                break
-
-            fresh = False
-            for job in new_jobs[skip if page == first_page else 0 :]:
+                self.log.info(f"search page: {page}")
                 try:
-                    posted = Row.model_validate(job).createdDate / 1000
-                    if too_old(posted, scraper_input.hours_old):
-                        continue
-                    fresh = True
-                    job_post = self._process_job(job)
-                except Exception as e:
-                    self.log.warning(f"skipping job: {e}")
-                    continue
-                if job_post:
-                    job_list.append(job_post)
-                    if len(job_list) >= scraper_input.results_wanted:
+                    response = self.session.get(
+                        self.search_url,
+                        params=params | {"pageNo": page},
+                        headers=headers | {"nkparam": generate_nkparam("srp")},
+                    )
+                    if response.status_code == 400 and page > 1:
+                        break  # past the last page
+                    if response.status_code == 406:
+                        self.fail(
+                            "response status code 406 (recaptcha required): "
+                            "the address is rate limited, or the request token was "
+                            "rejected (the public key in jobspy/naukri/constant.py "
+                            "may be out of date)"
+                        )
                         break
+                    check_status(response)
+                    result = JobSearch.model_validate(response.json())
+                    jobs = result.jobDetails or []
+                    last_page = math.ceil(result.noOfJobs / jobs_per_page)
+                    new_jobs = [job for job in jobs if job.get("jobId") not in seen]
+                    seen.update(job.get("jobId") for job in jobs)
+                except Exception as e:
+                    self.fail(str(e))
+                    break
 
-            if not fresh or page >= last_page:
-                break
-            page += 1
+                fresh = False
+                page_jobs: list[JobPost] = []
+                for job in new_jobs[skip if page == first_page else 0 :]:
+                    try:
+                        posted = Row.model_validate(job).createdDate / 1000
+                        if too_old(posted, scraper_input.hours_old):
+                            continue
+                        fresh = True
+                        job_post = self._process_job(job)
+                    except Exception as e:
+                        self.log.warning(f"skipping job: {e}")
+                        continue
+                    if job_post:
+                        page_jobs.append(job_post)
+                        if total + len(page_jobs) >= scraper_input.results_wanted:
+                            break
+                total += len(page_jobs)
+                if page_jobs:
+                    yield page_jobs
 
-        return job_list
+                if not fresh or page >= last_page:
+                    break
+                page += 1
+            self._finish(total, scraper_input.results_wanted)
+        finally:
+            self.session.close()
 
     def _search_params(self) -> dict[str, str | int]:
         params = search_params | {"keyword": self.scraper_input.search_term or ""}

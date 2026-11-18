@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from threading import Event
 from urllib.parse import urlsplit
 
 from jobspy.indeed.constant import (
@@ -24,6 +25,7 @@ from jobspy.model import (
     JobPost,
     JobType,
     Location,
+    PageStream,
     Scraper,
     ScraperInput,
 )
@@ -39,7 +41,9 @@ from jobspy.util import (
 class Indeed(Scraper):
     api_url = "https://apis.indeed.com/graphql"
 
-    def scrape(self, scraper_input: ScraperInput) -> list[JobPost]:
+    def iter_pages(
+        self, scraper_input: ScraperInput, stop: Event | None = None
+    ) -> PageStream:
         self.scraper_input = scraper_input
         country_code = country_codes[scraper_input.country_indeed]
         domain = subdomains.get(scraper_input.country_indeed, country_code.lower())
@@ -54,53 +58,59 @@ class Indeed(Scraper):
                 "indeed-locale": f"{language}-{country_code}",
             },
         )
-        filters = self._build_filters()
-        job_list: list[JobPost] = []
-        seen: set[object] = set()
-        skip = scraper_input.offset
-        cursor = None
-        page = 1
+        try:
+            filters = self._build_filters()
+            total = 0
+            seen: set[object] = set()
+            skip = scraper_input.offset
+            cursor = None
+            page = 1
 
-        while len(job_list) < scraper_input.results_wanted:
-            self.log.info(f"search page: {page}")
-            try:
-                response = self.session.post(
-                    self.api_url,
-                    json={"query": self._build_query(filters, cursor)},
-                )
-                check_status(response)
-                data = response.json()
-                search = (data.get("data") or {}).get("jobSearch")
-                if not search:
-                    raise ValueError(f"API error: {data.get('errors')}")
-                job_search = JobSearch.model_validate(search)
-                jobs = {
-                    result.job["key"]: result.job
-                    for result in job_search.results
-                    if result.job
-                }
-                new_jobs = [job for key, job in jobs.items() if key not in seen]
-                seen.update(jobs)
-                cursor = job_search.nextCursor
-            except Exception as e:
-                self.fail(str(e))
-                break
-
-            for job in new_jobs[skip:]:
+            while total < scraper_input.results_wanted:
+                self.log.info(f"search page: {page}")
                 try:
-                    job_list.append(self._process_job(job))
+                    response = self.session.post(
+                        self.api_url,
+                        json={"query": self._build_query(filters, cursor)},
+                    )
+                    check_status(response)
+                    data = response.json()
+                    search = (data.get("data") or {}).get("jobSearch")
+                    if not search:
+                        raise ValueError(f"API error: {data.get('errors')}")
+                    job_search = JobSearch.model_validate(search)
+                    jobs = {
+                        result.job["key"]: result.job
+                        for result in job_search.results
+                        if result.job
+                    }
+                    new_jobs = [job for key, job in jobs.items() if key not in seen]
+                    seen.update(jobs)
+                    cursor = job_search.nextCursor
                 except Exception as e:
-                    self.log.warning(f"skipping job: {e}")
-                    continue
-                if len(job_list) >= scraper_input.results_wanted:
+                    self.fail(str(e))
                     break
-            skip = max(skip - len(new_jobs), 0)
 
-            if not new_jobs or not cursor:
-                break
-            page += 1
+                page_jobs: list[JobPost] = []
+                for job in new_jobs[skip:]:
+                    try:
+                        page_jobs.append(self._process_job(job))
+                    except Exception as e:
+                        self.log.warning(f"skipping job: {e}")
+                        continue
+                    if total + len(page_jobs) >= scraper_input.results_wanted:
+                        break
+                skip = max(skip - len(new_jobs), 0)
+                total += len(page_jobs)
+                if page_jobs:
+                    yield page_jobs
 
-        return job_list
+                if not new_jobs or not cursor:
+                    break
+                page += 1
+            self._finish(total, scraper_input.results_wanted)
+        finally:
+            self.session.close()
 
     def _build_query(self, filters: str, cursor: str | None) -> str:
         search_term = self.scraper_input.search_term

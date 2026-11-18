@@ -12,15 +12,16 @@ from functools import partial
 from importlib.metadata import version
 from pathlib import Path
 
-from jobspy import scrape_jobs
-from jobspy.model import JobType
+from jobspy import stream_jobs
+from jobspy.model import JobPost, JobType, SiteResult, SiteStatus
 from jobspy.records import (
     DEFAULT_SITES,
     FIELDS,
     PREVIEW,
     REGIONAL,
     commas,
-    lines,
+    frame,
+    job_lines,
     save,
     save_path,
 )
@@ -177,20 +178,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8")
     logging.basicConfig(format="%(levelname)s: %(name)s: %(message)s")
     try:
-        jobs = scrape_jobs(**args)
+        events = stream_jobs(**args)
     except ValueError as error:
         p.error(str(error))
-    failed = jobs.empty and set(args["site_name"]) <= jobs.attrs["errors"].keys()
-    if output and not failed:
+    jsonl = None
+    if output and output.lower().endswith(".jsonl"):
         try:
-            save(jobs, output)
+            os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+            jsonl = open(output, "w", encoding="utf-8")
         except OSError as error:
             p.error(f"cannot write {output}: {error.strerror or error}")
-        print(f"saved {len(jobs)} jobs to {output}", file=sys.stderr)
+    total = 0
+    failed_sites: set[str] = set()
+    collected: list[JobPost] = []
     try:
-        sys.stdout.writelines(lines(jobs, names))
-        sys.stdout.flush()
-    except BrokenPipeError:
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        return 1
+        for event in events:
+            if isinstance(event, SiteResult):
+                if event.status is SiteStatus.FAILED:
+                    failed_sites.add(event.site.value)
+                continue
+            total += len(event.jobs)
+            if jsonl:
+                jsonl.writelines(job_lines(event.jobs, FIELDS))
+            elif output:
+                collected.extend(event.jobs)
+            try:
+                sys.stdout.writelines(job_lines(event.jobs, names))
+                sys.stdout.flush()
+            except BrokenPipeError:
+                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+                return 1
+    finally:
+        events.close()
+        if jsonl:
+            jsonl.close()
+    failed = not total and set(args["site_name"]) <= failed_sites
+    if output and not jsonl and not failed:
+        try:
+            save(frame(collected), output)
+        except OSError as error:
+            p.error(f"cannot write {output}: {error.strerror or error}")
+    if output and not failed:
+        print(f"saved {total} jobs to {output}", file=sys.stderr)
     return int(failed)

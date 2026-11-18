@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable, Sequence
+from datetime import date
+from typing import get_args
 
 import pandas as pd
 
@@ -15,6 +18,37 @@ PREVIEW = (
 DEFAULT_SITES = ["indeed", "linkedin", "zip_recruiter", "glassdoor"]
 REGIONAL = "bayt (Middle East), naukri (India), bdjobs (Bangladesh), hellowork (France)"
 FORMATS = (".csv", ".json", ".jsonl")
+
+column_types = {
+    name: {
+        str: "str",
+        float: "float64",
+        int: "int64",
+        bool: "bool",
+        date: "object",
+    }.get((get_args(field.annotation) or (field.annotation,))[0], "str")
+    for name, field in JobPost.model_fields.items()
+}
+
+
+def frame(jobs: list[JobPost]) -> pd.DataFrame:
+    """A DataFrame of the jobs, newest first within each site."""
+    jobs_df = pd.DataFrame([job.model_dump() for job in jobs], columns=FIELDS)
+    if jobs:
+        return jobs_df.sort_values(
+            by=["site", "date_posted"], ascending=[True, False]
+        ).reset_index(drop=True)
+    return jobs_df.astype(column_types)
+
+
+def job_lines(jobs: Iterable[JobPost], names: Sequence[str]) -> list[str]:
+    """One JSON line per job, with only the named fields that have a value."""
+    lines = []
+    for job in jobs:
+        row = job.model_dump()
+        record = {name: row[name] for name in names if row.get(name) is not None}
+        lines.append(dumps(record) + "\n")
+    return lines
 
 
 def records(jobs: pd.DataFrame, names: list[str]) -> list[dict[str, object]]:

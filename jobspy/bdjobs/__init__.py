@@ -3,8 +3,8 @@ from __future__ import annotations
 import math
 import random
 import re
-import time
 from datetime import datetime
+from threading import Event
 from urllib.parse import urlparse
 
 from jobspy.bdjobs.constant import (
@@ -22,6 +22,7 @@ from jobspy.model import (
     JobPost,
     JobType,
     Location,
+    PageStream,
     Scraper,
     ScraperInput,
 )
@@ -40,58 +41,66 @@ class BDJobs(Scraper):
     details_url = "https://gateway.bdjobs.com/jobapply/api/JobSubsystem/Job-Details"
     delay = (2, 5)
 
-    def scrape(self, scraper_input: ScraperInput) -> list[JobPost]:
+    def iter_pages(
+        self, scraper_input: ScraperInput, stop: Event | None = None
+    ) -> PageStream:
         self.scraper_input = scraper_input
         self.session = create_session(
             RequestsRotating(scraper_input.proxies), scraper_input
         )
-        params = self._search_params()
-        job_list: list[JobPost] = []
-        seen = set()
-        page, skip = 1, scraper_input.offset
+        try:
+            params = self._search_params()
+            total = 0
+            seen = set()
+            page, skip = 1, scraper_input.offset
 
-        while len(job_list) < scraper_input.results_wanted:
-            if page > 1:
-                time.sleep(random.uniform(*self.delay))
-            self.log.info(f"search page: {page}")
-            try:
-                response = self.session.get(
-                    self.search_url,
-                    params=params | {"pg": page},
-                )
-                check_status(response)
-                result = JobSearch.model_validate(response.json())
-                jobs = result.data
-                if page == 1:
-                    jobs = (result.premiumData or []) + jobs
-                last_page = result.totalpages
-                new_jobs = []
-                for job in jobs:
-                    if job.get("Jobid") not in seen:
-                        seen.add(job.get("Jobid"))
-                        new_jobs.append(job)
-            except Exception as e:
-                self.fail(str(e))
-                break
-
-            for job in new_jobs[skip:]:
+            while total < scraper_input.results_wanted:
+                if page > 1 and self._interrupted(stop, random.uniform(*self.delay)):
+                    break
+                self.log.info(f"search page: {page}")
                 try:
-                    job_post = self._process_job(job)
+                    response = self.session.get(
+                        self.search_url,
+                        params=params | {"pg": page},
+                    )
+                    check_status(response)
+                    result = JobSearch.model_validate(response.json())
+                    jobs = result.data
+                    if page == 1:
+                        jobs = (result.premiumData or []) + jobs
+                    last_page = result.totalpages
+                    new_jobs = []
+                    for job in jobs:
+                        if job.get("Jobid") not in seen:
+                            seen.add(job.get("Jobid"))
+                            new_jobs.append(job)
                 except Exception as e:
-                    self.log.warning(f"skipping job: {e}")
-                    continue
-                if job_post:
-                    job_list.append(job_post)
-                    if len(job_list) >= scraper_input.results_wanted:
-                        break
+                    self.fail(str(e))
+                    break
 
-            skip = max(skip - len(new_jobs), 0)
-            page += 1 + skip // jobs_per_page
-            skip %= jobs_per_page
-            if not new_jobs or page > last_page:
-                break
+                page_jobs: list[JobPost] = []
+                for job in new_jobs[skip:]:
+                    try:
+                        job_post = self._process_job(job)
+                    except Exception as e:
+                        self.log.warning(f"skipping job: {e}")
+                        continue
+                    if job_post:
+                        page_jobs.append(job_post)
+                        if total + len(page_jobs) >= scraper_input.results_wanted:
+                            break
+                total += len(page_jobs)
+                if page_jobs:
+                    yield page_jobs
 
-        return job_list
+                skip = max(skip - len(new_jobs), 0)
+                page += 1 + skip // jobs_per_page
+                skip %= jobs_per_page
+                if not new_jobs or page > last_page:
+                    break
+            self._finish(total, scraper_input.results_wanted)
+        finally:
+            self.session.close()
 
     def _search_params(self) -> dict[str, str | int]:
         params = search_params | {"keyword": self.scraper_input.search_term or ""}

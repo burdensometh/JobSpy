@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Generator
+from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
+from threading import Event
 
 from pydantic import (
     BaseModel,
@@ -240,6 +244,40 @@ class Site(Enum):
     HELLOWORK = "hellowork"
 
 
+class SiteStatus(Enum):
+    """How a site's job stream ended."""
+
+    EXHAUSTED = "exhausted"
+    """The site has no more matching jobs."""
+    LIMIT_REACHED = "limit_reached"
+    """The site delivered the requested number of jobs."""
+    FAILED = "failed"
+    """The site gave up early; the jobs it delivered are partial."""
+
+
+@dataclass
+class JobBatch:
+    """One parsed search page of jobs from a site."""
+
+    site: Site
+    jobs: list[JobPost]
+
+
+@dataclass
+class SiteResult:
+    """A site's terminal state; the last event of every site's stream."""
+
+    site: Site
+    status: SiteStatus
+    error: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+StreamEvent = JobBatch | SiteResult
+PageStream = Generator[list[JobPost], None, None]
+"""A scraper's job stream: one parsed search page at a time, closable."""
+
+
 class ScraperInput(BaseModel):
     site_name: list[Site] = Field(
         [site for site in Site if site != Site.GOOGLE], min_length=1
@@ -285,6 +323,7 @@ class Scraper(ABC):
         self.log = logging.getLogger(type(self).__module__)
         self.error: str | None = None
         self.warnings: list[str] = []
+        self.status: SiteStatus | None = None
 
     def fail(self, message: str) -> None:
         self.log.error(message)
@@ -294,5 +333,34 @@ class Scraper(ABC):
         self.log.warning(message)
         self.warnings.append(message)
 
+    def scrape(self, scraper_input: ScraperInput) -> list[JobPost]:
+        """Every job of the search: all pages of iter_pages, flattened."""
+        return [job for page in self.iter_pages(scraper_input) for job in page]
+
     @abstractmethod
-    def scrape(self, scraper_input: ScraperInput) -> list[JobPost]: ...
+    def iter_pages(
+        self, scraper_input: ScraperInput, stop: Event | None = None
+    ) -> PageStream:
+        """Yields each search page's jobs as soon as it is parsed.
+
+        Stops paginating when stop is set, and closes the session when the
+        iteration ends or the generator is closed. Sets self.status to the
+        terminal SiteStatus when it finishes on its own.
+        """
+
+    def _finish(self, count: int, wanted: int) -> None:
+        """Sets the terminal status of an iteration that delivered count jobs."""
+        if self.error:
+            self.status = SiteStatus.FAILED
+        elif count >= wanted:
+            self.status = SiteStatus.LIMIT_REACHED
+        else:
+            self.status = SiteStatus.EXHAUSTED
+
+    @staticmethod
+    def _interrupted(stop: Event | None, seconds: float) -> bool:
+        """Sleeps for seconds, waking early when stop is set; True when woken."""
+        if stop is None:
+            time.sleep(seconds)
+            return False
+        return stop.wait(seconds)

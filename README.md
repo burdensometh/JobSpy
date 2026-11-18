@@ -49,6 +49,33 @@ print(jobs.head())
 jobs.to_csv("jobs.csv", index=False)
 ```
 
+## Streaming
+
+`scrape_jobs` returns only after every board is done. `stream_jobs` takes the
+same parameters and yields each page as soon as it is parsed, so large
+searches can be processed while slower boards are still running:
+
+```python
+from jobspy import JobBatch, SiteStatus, stream_jobs
+
+for event in stream_jobs(
+    site_name=["indeed", "linkedin"],
+    search_term="software engineer",
+    results_wanted=100,
+):
+    if isinstance(event, JobBatch):
+        print(f"{len(event.jobs)} jobs from {event.site.value}")  # one parsed page
+    elif event.status is SiteStatus.FAILED:
+        print(f"{event.site.value} gave partial results: {event.error}")
+```
+
+Each board yields `JobBatch` events followed by exactly one `SiteResult` with
+its terminal status: `EXHAUSTED` (no more jobs), `LIMIT_REACHED`
+(`results_wanted` delivered) or `FAILED` (the jobs it gave are partial). At
+most `buffer_pages` batches are buffered, so a slow consumer slows the boards
+down instead of growing memory; closing the generator (e.g. `break` out of the
+loop) cancels the remaining pages and closes the boards' sessions.
+
 ## Output
 
 ```

@@ -5,6 +5,7 @@ import random
 import re
 import time
 from datetime import datetime, timezone
+from threading import Event
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup, Tag
@@ -26,6 +27,7 @@ from jobspy.model import (
     Country,
     JobPost,
     Location,
+    PageStream,
     Scraper,
     ScraperInput,
 )
@@ -54,54 +56,64 @@ class HelloWork(Scraper):
     search_url = f"{base_url}/fr-fr/emploi/recherche.html"
     delay = (2, 5)
 
-    def scrape(self, scraper_input: ScraperInput) -> list[JobPost]:
+    def iter_pages(
+        self, scraper_input: ScraperInput, stop: Event | None = None
+    ) -> PageStream:
         self.scraper_input = scraper_input
         self.session = create_session(TLSRotating(scraper_input.proxies), scraper_input)
-        params = self._search_params()
-        job_list: list[JobPost] = []
-        seen: set[object] = set()
-        first_page = page = scraper_input.offset // jobs_per_page + 1
-        skip = scraper_input.offset % jobs_per_page
+        try:
+            params = self._search_params()
+            total = 0
+            seen: set[object] = set()
+            first_page = page = scraper_input.offset // jobs_per_page + 1
+            skip = scraper_input.offset % jobs_per_page
 
-        while len(job_list) < scraper_input.results_wanted:
-            if page > first_page:
-                time.sleep(random.uniform(*self.delay))
-            self.log.info(f"search page: {page}")
-            try:
-                response = self.session.get(
-                    self.search_url, params=params | {"p": page}
-                )
-                check_status(response)
-                soup = BeautifulSoup(response.text, "html.parser")
-                cards = soup.select("li[data-id-storage-target=item]")
-                pager = soup.select_one("input[type=number][max]")
-                last_page = int(str(pager["max"])) if pager else page
-            except Exception as e:
-                self.fail(str(e))
-                break
-
-            new_cards = [
-                card
-                for card in cards
-                if card.get("data-id-storage-item-id") not in seen
-            ]
-            seen.update(card.get("data-id-storage-item-id") for card in cards)
-            for card in new_cards[skip if page == first_page else 0 :]:
+            while total < scraper_input.results_wanted:
+                if page > first_page and self._interrupted(
+                    stop, random.uniform(*self.delay)
+                ):
+                    break
+                self.log.info(f"search page: {page}")
                 try:
-                    job_post = self._process_job(card)
+                    response = self.session.get(
+                        self.search_url, params=params | {"p": page}
+                    )
+                    check_status(response)
+                    soup = BeautifulSoup(response.text, "html.parser")
+                    cards = soup.select("li[data-id-storage-target=item]")
+                    pager = soup.select_one("input[type=number][max]")
+                    last_page = int(str(pager["max"])) if pager else page
                 except Exception as e:
-                    self.log.warning(f"skipping job: {e}")
-                    continue
-                if job_post:
-                    job_list.append(job_post)
-                    if len(job_list) >= scraper_input.results_wanted:
-                        break
+                    self.fail(str(e))
+                    break
 
-            if not new_cards or page >= last_page:
-                break
-            page += 1
+                new_cards = [
+                    card
+                    for card in cards
+                    if card.get("data-id-storage-item-id") not in seen
+                ]
+                seen.update(card.get("data-id-storage-item-id") for card in cards)
+                page_jobs: list[JobPost] = []
+                for card in new_cards[skip if page == first_page else 0 :]:
+                    try:
+                        job_post = self._process_job(card)
+                    except Exception as e:
+                        self.log.warning(f"skipping job: {e}")
+                        continue
+                    if job_post:
+                        page_jobs.append(job_post)
+                        if total + len(page_jobs) >= scraper_input.results_wanted:
+                            break
+                total += len(page_jobs)
+                if page_jobs:
+                    yield page_jobs
 
-        return job_list
+                if not new_cards or page >= last_page:
+                    break
+                page += 1
+            self._finish(total, scraper_input.results_wanted)
+        finally:
+            self.session.close()
 
     def _search_params(self) -> dict[str, str | int | list[str]]:
         scraper_input = self.scraper_input

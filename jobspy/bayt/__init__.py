@@ -5,6 +5,7 @@ import random
 import re
 import time
 from itertools import takewhile
+from threading import Event
 from urllib.parse import quote, urlencode, urljoin
 
 from bs4 import BeautifulSoup, Tag
@@ -22,6 +23,7 @@ from jobspy.model import (
     CompensationInterval,
     JobPost,
     Location,
+    PageStream,
     Scraper,
     ScraperInput,
 )
@@ -42,58 +44,68 @@ class Bayt(Scraper):
     base_url = "https://www.bayt.com"
     delay = (2, 5)
 
-    def scrape(self, scraper_input: ScraperInput) -> list[JobPost]:
+    def iter_pages(
+        self, scraper_input: ScraperInput, stop: Event | None = None
+    ) -> PageStream:
         self.scraper_input = scraper_input
         self.session = create_session(TLSRotating(scraper_input.proxies), scraper_input)
-        self.hybrid_ids: set[str] | None = None
-        job_type = scraper_input.job_type
-        if job_type and job_type not in job_type_codes:
-            self.warn(f"job_type {job_type.value} isn't supported, ignoring it")
-        self.country, self.city = self._location(scraper_input.location)
-        hours_old = scraper_input.hours_old
-        oldest = time.time() - hours_old * 3600 if hours_old else 0
-        job_list: list[JobPost] = []
-        seen: set[object] = set()
-        first_page = page = scraper_input.offset // jobs_per_page + 1
-        skip = scraper_input.offset % jobs_per_page
+        try:
+            self.hybrid_ids: set[str] | None = None
+            job_type = scraper_input.job_type
+            if job_type and job_type not in job_type_codes:
+                self.warn(f"job_type {job_type.value} isn't supported, ignoring it")
+            self.country, self.city = self._location(scraper_input.location)
+            hours_old = scraper_input.hours_old
+            oldest = time.time() - hours_old * 3600 if hours_old else 0
+            total = 0
+            seen: set[object] = set()
+            first_page = page = scraper_input.offset // jobs_per_page + 1
+            skip = scraper_input.offset % jobs_per_page
 
-        while len(job_list) < scraper_input.results_wanted:
-            if page > first_page:
-                time.sleep(random.uniform(*self.delay))
-            self.log.info(f"search page: {page}")
-            cards = self._fetch_cards(page)
-            if cards is None:
-                break
-            if page == first_page:
-                cards = cards[skip:]
-
-            cards = [card for card in cards if card.get("data-job-id") not in seen]
-            if not cards:
-                break
-            seen.update(card.get("data-job-id") for card in cards)
-            new = list(
-                takewhile(lambda c: (self._timestamp(c) or oldest) >= oldest, cards)
-            )
-            if new and scraper_input.is_remote and self.hybrid_ids is None:
-                self.hybrid_ids = self._fetch_hybrid_ids()
-                if self.hybrid_ids is None:
+            while total < scraper_input.results_wanted:
+                if page > first_page and self._interrupted(
+                    stop, random.uniform(*self.delay)
+                ):
                     break
-            for job in new:
-                try:
-                    job_post = self._process_job(job)
-                except Exception as e:
-                    self.log.warning(f"skipping job: {e}")
-                    continue
-                if job_post:
-                    job_list.append(job_post)
-                    if len(job_list) >= scraper_input.results_wanted:
+                self.log.info(f"search page: {page}")
+                cards = self._fetch_cards(page)
+                if cards is None:
+                    break
+                if page == first_page:
+                    cards = cards[skip:]
+
+                cards = [card for card in cards if card.get("data-job-id") not in seen]
+                if not cards:
+                    break
+                seen.update(card.get("data-job-id") for card in cards)
+                new = list(
+                    takewhile(lambda c: (self._timestamp(c) or oldest) >= oldest, cards)
+                )
+                if new and scraper_input.is_remote and self.hybrid_ids is None:
+                    self.hybrid_ids = self._fetch_hybrid_ids(stop)
+                    if self.hybrid_ids is None:
                         break
+                page_jobs: list[JobPost] = []
+                for job in new:
+                    try:
+                        job_post = self._process_job(job)
+                    except Exception as e:
+                        self.log.warning(f"skipping job: {e}")
+                        continue
+                    if job_post:
+                        page_jobs.append(job_post)
+                        if total + len(page_jobs) >= scraper_input.results_wanted:
+                            break
+                total += len(page_jobs)
+                if page_jobs:
+                    yield page_jobs
 
-            if len(new) < len(cards):
-                break
-            page += 1
-
-        return job_list
+                if len(new) < len(cards):
+                    break
+                page += 1
+            self._finish(total, scraper_input.results_wanted)
+        finally:
+            self.session.close()
 
     @staticmethod
     def _location(location: str | None) -> tuple[str, str | None]:
@@ -157,7 +169,7 @@ class Bayt(Scraper):
             return []
         return BeautifulSoup(response.text, "html.parser").select("li[data-js-job]")
 
-    def _fetch_hybrid_ids(self) -> set[str] | None:
+    def _fetch_hybrid_ids(self, stop: Event | None = None) -> set[str] | None:
         """The search's hybrid jobs: the remote filter returns them too, and not
         every card carries the label that tells them apart."""
         ids: set[str] = set()
@@ -175,7 +187,8 @@ class Bayt(Scraper):
             if len(cards) < jobs_per_page or not new:
                 return ids
             page += 1
-            time.sleep(random.uniform(*self.delay))
+            if self._interrupted(stop, random.uniform(*self.delay)):
+                return ids
 
     @staticmethod
     def _timestamp(job: Tag) -> int | None:

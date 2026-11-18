@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta, timezone
+from threading import Event
 from urllib.parse import quote
 
 from curl_cffi.requests import Response
@@ -28,6 +29,7 @@ from jobspy.model import (
     Compensation,
     JobPost,
     Location,
+    PageStream,
     Scraper,
     ScraperInput,
 )
@@ -41,84 +43,96 @@ from jobspy.util import (
 
 
 class Glassdoor(Scraper):
-    def scrape(self, scraper_input: ScraperInput) -> list[JobPost]:
+    def iter_pages(
+        self, scraper_input: ScraperInput, stop: Event | None = None
+    ) -> PageStream:
         self.scraper_input = scraper_input
         country = scraper_input.country_indeed
         if country not in domains:
             self.warn(f"country_indeed {country.value} isn't supported, skipping it")
-            return []
+            self._finish(0, scraper_input.results_wanted)
+            return
+        self.base_url = f"https://{domains[country]}"
+        self.session = create_session(
+            TLSRotating(scraper_input.proxies), scraper_input, headers
+        )
         try:
-            self.base_url = f"https://{domains[country]}"
-            self.session = create_session(
-                TLSRotating(scraper_input.proxies), scraper_input, headers
-            )
-            variables = self._search_variables()
-        except Exception as e:
-            self.fail(str(e))
-            return []
-        if variables is None:
-            return []
-
-        job_list: list[JobPost] = []
-        seen: set[int | None] = set()
-        page, skip = 1, scraper_input.offset
-        cursor: str | None = None
-
-        while len(job_list) < scraper_input.results_wanted:
-            self.log.info(f"search page: {page}")
             try:
-                response = self._graph(
-                    "JobSearchResultsQuery",
-                    search_query,
-                    {**variables, "pageNumber": page, "pageCursor": cursor},
-                )
-                check_status(response)
-                answer = response.json()[0]
-                result = (answer.get("data") or {}).get("jobListings")
-                if not result:
-                    raise ValueError(f"API error: {answer.get('errors')}")
-                job_listings = JobListings.model_validate(result)
-                listings = job_listings.jobListings or []
-                cursors = job_listings.paginationCursors or []
-                cursor = {c.pageNumber: c.cursor for c in cursors}.get(page + 1)
+                variables = self._search_variables()
             except Exception as e:
                 self.fail(str(e))
-                break
+                variables = None
+            if variables is None:
+                self._finish(0, scraper_input.results_wanted)
+                return
 
-            seen_before = len(seen)
-            page_jobs: list[JobPost] = []
-            for listing in listings:
+            total = 0
+            seen: set[int | None] = set()
+            page, skip = 1, scraper_input.offset
+            cursor: str | None = None
+
+            while total < scraper_input.results_wanted:
+                self.log.info(f"search page: {page}")
                 try:
-                    entry = Listing.model_validate(listing)
-                    job, job_id = entry.jobview, entry.listingId
-                    if job_id in seen:
-                        continue
-                    seen.add(job_id)
-                    if skip:
-                        skip -= 1
-                        continue
-                    job_post = self._process_job(job)
+                    response = self._graph(
+                        "JobSearchResultsQuery",
+                        search_query,
+                        {**variables, "pageNumber": page, "pageCursor": cursor},
+                    )
+                    check_status(response)
+                    answer = response.json()[0]
+                    result = (answer.get("data") or {}).get("jobListings")
+                    if not result:
+                        raise ValueError(f"API error: {answer.get('errors')}")
+                    job_listings = JobListings.model_validate(result)
+                    listings = job_listings.jobListings or []
+                    cursors = job_listings.paginationCursors or []
+                    cursor = {c.pageNumber: c.cursor for c in cursors}.get(page + 1)
                 except Exception as e:
-                    self.log.warning(f"skipping job: {e}")
-                    continue
-                if job_post:
-                    page_jobs.append(job_post)
-                    if len(job_list) + len(page_jobs) >= scraper_input.results_wanted:
-                        break
+                    self.fail(str(e))
+                    break
 
-            if scraper_input.fetch_description and page_jobs:
-                details = self._fetch_details([job.id for job in page_jobs if job.id])
-                page_jobs = [
-                    job.model_copy(update=details[job.id] if job.id in details else {})
-                    for job in page_jobs
-                ]
-            job_list += page_jobs
+                seen_before = len(seen)
+                page_jobs: list[JobPost] = []
+                for listing in listings:
+                    try:
+                        entry = Listing.model_validate(listing)
+                        job, job_id = entry.jobview, entry.listingId
+                        if job_id in seen:
+                            continue
+                        seen.add(job_id)
+                        if skip:
+                            skip -= 1
+                            continue
+                        job_post = self._process_job(job)
+                    except Exception as e:
+                        self.log.warning(f"skipping job: {e}")
+                        continue
+                    if job_post:
+                        page_jobs.append(job_post)
+                        if total + len(page_jobs) >= scraper_input.results_wanted:
+                            break
 
-            if not cursor or len(seen) == seen_before:
-                break
-            page += 1
+                if scraper_input.fetch_description and page_jobs:
+                    details = self._fetch_details(
+                        [job.id for job in page_jobs if job.id]
+                    )
+                    page_jobs = [
+                        job.model_copy(
+                            update=details[job.id] if job.id in details else {}
+                        )
+                        for job in page_jobs
+                    ]
+                total += len(page_jobs)
+                if page_jobs:
+                    yield page_jobs
 
-        return job_list
+                if not cursor or len(seen) == seen_before:
+                    break
+                page += 1
+            self._finish(total, scraper_input.results_wanted)
+        finally:
+            self.session.close()
 
     def _graph(
         self, operation: str, query: str, variables: dict[str, object]

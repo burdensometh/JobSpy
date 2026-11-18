@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import random
 import re
-import time
 from datetime import date
+from threading import Event
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -28,6 +28,7 @@ from jobspy.model import (
     CompensationInterval,
     Country,
     JobPost,
+    PageStream,
     Scraper,
     ScraperInput,
     annual_factor,
@@ -46,70 +47,80 @@ class LinkedIn(Scraper):
     base_url = "https://www.linkedin.com"
     delay = (3, 7)
 
-    def scrape(self, scraper_input: ScraperInput) -> list[JobPost]:
+    def iter_pages(
+        self, scraper_input: ScraperInput, stop: Event | None = None
+    ) -> PageStream:
         self.scraper_input = scraper_input
         self.session = create_session(
             RequestsRotating(scraper_input.proxies, clear_cookies=True),
             scraper_input,
             headers,
         )
-        for name in ("is_remote", "job_type"):
-            if getattr(scraper_input, name):
-                self.warn(f"{name} isn't supported, ignoring it")
-        params = self._search_params()
-        job_list: list[JobPost] = []
-        seen = set()
-        first_start = start = scraper_input.offset
-        page = 1
+        try:
+            for name in ("is_remote", "job_type"):
+                if getattr(scraper_input, name):
+                    self.warn(f"{name} isn't supported, ignoring it")
+            params = self._search_params()
+            total = 0
+            seen = set()
+            first_start = start = scraper_input.offset
+            page = 1
 
-        while len(job_list) < scraper_input.results_wanted and start < max_results:
-            if start > first_start:
-                time.sleep(random.uniform(*self.delay))
-            self.log.info(f"search page: {page}")
-            try:
-                response = self.session.get(
-                    f"{self.base_url}/jobs-guest/jobs/api/seeMoreJobPostings/search",
-                    params={**params, "start": start},
-                )
-                check_status(response)
-            except Exception as e:
-                self.fail(str(e))
-                break
-
-            soup = BeautifulSoup(response.text, "html.parser")
-            job_cards = soup.find_all(class_="base-search-card")
-            if not job_cards:
-                if response.text.strip() != empty_page:
-                    self.fail("unexpected page with no jobs (blocked?)")
-                elif start:
-                    self.log.warning(
-                        f"empty page at start={start} (the end of the results, or throttled)"
-                    )
-                break
-
-            new_cards = []
-            for job_card in job_cards:
-                job_id = str(job_card.get("data-entity-urn", "")).split(":")[-1]
-                if job_id and job_id not in seen:
-                    seen.add(job_id)
-                    new_cards.append((job_id, job_card))
-
-            for job_id, job_card in new_cards:
+            while total < scraper_input.results_wanted and start < max_results:
+                if start > first_start and self._interrupted(
+                    stop, random.uniform(*self.delay)
+                ):
+                    break
+                self.log.info(f"search page: {page}")
                 try:
-                    job_post = self._process_job(job_card, job_id)
+                    response = self.session.get(
+                        f"{self.base_url}/jobs-guest/jobs/api/seeMoreJobPostings/search",
+                        params={**params, "start": start},
+                    )
+                    check_status(response)
                 except Exception as e:
-                    self.log.warning(f"skipping job: {e}")
-                    continue
-                job_list.append(job_post)
-                if len(job_list) >= scraper_input.results_wanted:
+                    self.fail(str(e))
                     break
 
-            if not new_cards or len(job_cards) < jobs_per_page:
-                break
-            start += jobs_per_page
-            page += 1
+                soup = BeautifulSoup(response.text, "html.parser")
+                job_cards = soup.find_all(class_="base-search-card")
+                if not job_cards:
+                    if response.text.strip() != empty_page:
+                        self.fail("unexpected page with no jobs (blocked?)")
+                    elif start:
+                        self.log.warning(
+                            f"empty page at start={start} (the end of the results, or throttled)"
+                        )
+                    break
 
-        return job_list
+                new_cards = []
+                for job_card in job_cards:
+                    job_id = str(job_card.get("data-entity-urn", "")).split(":")[-1]
+                    if job_id and job_id not in seen:
+                        seen.add(job_id)
+                        new_cards.append((job_id, job_card))
+
+                page_jobs: list[JobPost] = []
+                for job_id, job_card in new_cards:
+                    try:
+                        job_post = self._process_job(job_card, job_id)
+                    except Exception as e:
+                        self.log.warning(f"skipping job: {e}")
+                        continue
+                    page_jobs.append(job_post)
+                    if total + len(page_jobs) >= scraper_input.results_wanted:
+                        break
+                total += len(page_jobs)
+                if page_jobs:
+                    yield page_jobs
+
+                if not new_cards or len(job_cards) < jobs_per_page:
+                    break
+                start += jobs_per_page
+                page += 1
+            self._finish(total, scraper_input.results_wanted)
+        finally:
+            self.session.close()
 
     def _search_params(self) -> dict[str, str | int]:
         scraper_input = self.scraper_input
