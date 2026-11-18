@@ -159,6 +159,22 @@ Optional
 ├── enforce_annual_salary (bool): 
 |    converts wages to annual salary
 |
+├── merge_duplicates (bool):
+|    merges records of the same job from several boards into one entity and keeps
+|    every source record (see "Merging the same job across boards" below)
+|
+├── source_priority (list|str):
+|    with merge_duplicates, the sites whose values win a conflict, best first
+|    (default puts hosting boards before aggregators)
+|
+├── max_results (int):
+|    with merge_duplicates, caps the merged entities (the unified count), not the
+|    source records
+|
+├── include_source_records (bool):
+|    with merge_duplicates, keeps every source record in the entity's sources
+|    (default True)
+|
 ├── ca_cert (str)
 |    path to CA Certificate file for proxies
 ```
@@ -223,6 +239,48 @@ HelloWork searches France. `location` takes a French city, postcode or region, e
 * LinkedIn rate limits bursts of requests with a 429, which clears within about a minute. Use proxies for larger searches.
 * Glassdoor rate limits above about 2 requests a second.
 
+## Merging the same job across boards
+
+The same posting often appears on the board that hosts it and on an aggregator that links to it, or on several boards that all send applicants to the same employer page. Set `merge_duplicates=True` (CLI `--merge`, MCP `merge_duplicates`) to get one entity per job instead of one row per board.
+
+A merge needs positive evidence:
+
+* `site_job_mapping` - one record's URL is another record's board posting (a Google result pointing at the LinkedIn job).
+* `native_job_id` - the same board's own job id.
+* `canonical_apply_url` - the same employer application URL once tracking parameters, scheme, host case, default ports and trailing slashes are normalised. URLs that address a search page or a company careers home are ignored.
+* `employer_job_id` - the same employer requisition id for the same employer (the ATS organisation in the URL, or the normalised company name when the URL has none).
+* `job_url` - the same canonical job page URL.
+
+Title and company similarity is deliberately not evidence: two postings with the same title and company but no shared identifier stay separate. What matched is recorded in `merge_evidence`.
+
+```py
+jobs = scrape_jobs(
+    site_name=["linkedin", "indeed", "google"],
+    search_term="data engineer",
+    merge_duplicates=True,
+    source_priority=["linkedin", "indeed", "google"],  # optional
+)
+jobs.loc[0, "source_count"]  # 3 boards behind this entity
+jobs.loc[0, "sources"]       # each board's original record, unchanged
+jobs.loc[0, "provenance"]    # conflicting fields, chosen value and alternatives
+```
+
+A conflicting field comes from the highest-priority source; `provenance[field]` holds the chosen `value`, its `site`, `source_id`, the `rule` and the `alternatives` from the other boards. Pay is chosen as one group (`salary_source`, `interval`, `min_amount`, `max_amount`, `currency`) so a yearly range is never mixed with an hourly one. `job_type`, `emails` and `skills` keep every board's values.
+
+`max_results` caps the merged entities - the unified count - and never the number of source records: a kept entity still carries every board's record in `sources`. To see each board's record separately, use `--expand` on the CLI or `expand=True` in MCP, or `jobspy.merge.expand_frame(jobs)` in Python. `jobspy.merge.expand_sources(entity)` returns one entity's original records.
+
+Withdrawing a source is a re-merge, not a delete:
+
+```py
+from jobspy.merge import retract_sources
+
+remaining = retract_sources(jobs.loc[0, "sources"], sites=["linkedin"])
+# the entity stays, built from the other sources; a withdrawn field's value
+# is replaced by the next source's, and nothing else is lost
+```
+
+For finer control, call `jobspy.merge.merge_jobs(records, MergeConfig(...))` directly; `MergeConfig` also accepts `field_priority` to override the source order for a named field.
+
 ## Frequently Asked Questions
 
 **Q: How do I tell a blocked board from one with no jobs?**  
@@ -268,8 +326,10 @@ This searches the description/title and must include software, summer, 2025, one
 
 ```plaintext
 JobPost
-├── id
+├── id: the board's id, or the entity id when merged
 ├── site
+├── entity_id: shared by the records of one job when merged
+├── employer_job_id: the employer's requisition id, when known
 ├── job_url
 ├── job_url_direct
 ├── title
@@ -301,7 +361,11 @@ JobPost
 ├── company_rating
 ├── company_reviews_count
 ├── vacancy_count
-└── work_from_home_type
+├── work_from_home_type
+├── source_count: boards behind a merged entity
+├── sources: each board's original record
+├── provenance: conflicting fields, chosen value and alternatives
+└── merge_evidence: the evidence that merged the sources
 ```
 
 A column is empty when the job board doesn't provide it.

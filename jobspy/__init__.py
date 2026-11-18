@@ -17,6 +17,11 @@ from jobspy.google import Google
 from jobspy.hellowork import HelloWork
 from jobspy.indeed import Indeed
 from jobspy.linkedin import LinkedIn
+from jobspy.merge import (
+    DEFAULT_SOURCE_PRIORITY,
+    MergeConfig,
+    merge_jobs,
+)
 from jobspy.model import (
     Country,
     DescriptionFormat,
@@ -80,11 +85,23 @@ def scrape_jobs(
     verbose: int | None = 1,
     user_agent: str | None = None,
     fetch_description: bool | None = False,
+    merge_duplicates: bool | None = False,
+    source_priority: str | Iterable[str] | None = None,
+    max_results: int | None = None,
+    include_source_records: bool | None = True,
 ) -> pd.DataFrame:
     """
     Scrapes job data from job boards concurrently
     :param linkedin_fetch_description: Deprecated since 1.2.0: use fetch_description;
         will be removed in 2.0.
+    :param merge_duplicates: merge records of the same job from different boards
+        into one entity, keeping every source record in ``sources``.
+    :param source_priority: sites, best first, whose values win a conflict when
+        merging (default: the boards that host postings before aggregators).
+    :param max_results: cap the merged entities (the unified count), not the
+        source records; only used when merging.
+    :param include_source_records: keep every source record in a merged
+        entity's ``sources`` (default True).
     :return: Pandas DataFrame containing job data
     :raises ValueError: an argument is invalid
     """
@@ -100,6 +117,9 @@ def scrape_jobs(
     except ValidationError as e:
         messages = []
         for error in e.errors():
+            if not error["loc"]:
+                messages.append(error["msg"].removeprefix("Value error, "))
+                continue
             name, value = error["loc"][0], error["input"]
             shown = type(value).__name__ if name == "proxies" else repr(value)
             messages.append(f"Invalid {name}: {shown}. {error['msg']}")
@@ -131,10 +151,24 @@ def scrape_jobs(
         for job in jobs
     ]
 
+    if scraper_input.merge_duplicates:
+        config = MergeConfig(
+            source_priority=(
+                tuple(scraper_input.source_priority)
+                if scraper_input.source_priority
+                else DEFAULT_SOURCE_PRIORITY
+            ),
+            max_entities=scraper_input.max_results,
+            embed_source_records=scraper_input.include_source_records,
+        )
+        rows = merge_jobs(rows, config)
+
     jobs_df = pd.DataFrame(
         [job.model_dump() for job in rows], columns=list(JobPost.model_fields)
     )
-    if rows:
+    if rows and scraper_input.merge_duplicates:
+        jobs_df = jobs_df.reset_index(drop=True)
+    elif rows:
         jobs_df = jobs_df.sort_values(
             by=["site", "date_posted"], ascending=[True, False]
         ).reset_index(drop=True)
@@ -143,5 +177,6 @@ def scrape_jobs(
     jobs_df.attrs = {
         "errors": {site: s.error for site, s, _ in results if s.error},
         "warnings": {site: s.warnings for site, s, _ in results if s.warnings},
+        "merged": scraper_input.merge_duplicates,
     }
     return jobs_df

@@ -189,22 +189,35 @@ class JobPost(BaseModel):
     company_reviews_count: int | None = None
     vacancy_count: int | None = None
     work_from_home_type: str | None = None
+    employer_job_id: str | None = None
+    entity_id: str | None = None
+    source_count: int | None = None
+    sources: list[dict[str, object]] | None = None
+    provenance: dict[str, dict[str, object]] | None = None
+    merge_evidence: list[dict[str, object]] | None = None
 
     @model_serializer
     def _row(self) -> dict[str, object]:
+        structured = {"sources", "provenance", "merge_evidence"}
+
         def text(value: object) -> object:
             if isinstance(value, Location):
                 return value.display_location()
             if isinstance(value, list):
                 return (
-                    ", ".join(v.value if isinstance(v, Enum) else v for v in value)
+                    ", ".join(v.value if isinstance(v, Enum) else str(v) for v in value)
                     or None
                 )
             if isinstance(value, Enum):
                 return str(value.value)
             return value
 
-        row = {name: text(getattr(self, name)) for name in type(self).model_fields}
+        row = {
+            name: getattr(self, name)
+            if name in structured
+            else text(getattr(self, name))
+            for name in type(self).model_fields
+        }
         has_pay = self.min_amount or self.max_amount
         row["salary_source"] = (
             (self.salary_source or "direct_data") if has_pay else None
@@ -263,12 +276,20 @@ class ScraperInput(BaseModel):
     results_wanted: int = Field(15, ge=1)
     hours_old: int | None = Field(None, ge=0)
     enforce_annual_salary: bool = False
+    merge_duplicates: bool = False
+    """Merge records of the same job from different boards into one entity."""
+    source_priority: list[str] | None = None
+    """Sites, best first, for conflicting fields when merging."""
+    max_results: int | None = Field(None, ge=1)
+    """Cap the merged entities (the unified count) when merging."""
+    include_source_records: bool = True
+    """Keep every source record in a merged entity's ``sources``."""
     proxies: list[str] = []
     ca_cert: FilePath | None = None
     user_agent: str | None = None
     verbose: int = Field(1, ge=0, le=2)
 
-    @field_validator("site_name", "proxies", mode="before")
+    @field_validator("site_name", "proxies", "source_priority", mode="before")
     @classmethod
     def _one_or_several(cls, value: object) -> object:
         return [value] if isinstance(value, (str, Enum)) else value
@@ -277,6 +298,19 @@ class ScraperInput(BaseModel):
     def _merge_linkedin_fetch_description(self) -> ScraperInput:
         if self.linkedin_fetch_description:
             self.fetch_description = True
+        return self
+
+    @model_validator(mode="after")
+    def _merge_only_options_need_merge(self) -> ScraperInput:
+        if not self.merge_duplicates:
+            ignored = [
+                name
+                for name in ("source_priority", "max_results")
+                if getattr(self, name)
+            ]
+            if ignored:
+                names = ", ".join(ignored)
+                raise ValueError(f"{names} need merge_duplicates")
         return self
 
 

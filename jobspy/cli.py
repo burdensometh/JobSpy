@@ -17,9 +17,11 @@ from jobspy.model import JobType
 from jobspy.records import (
     DEFAULT_SITES,
     FIELDS,
+    MERGE_FIELDS,
     PREVIEW,
     REGIONAL,
     commas,
+    expand_frame,
     lines,
     save,
     save_path,
@@ -29,12 +31,17 @@ DESCRIPTION = """\
 Search job boards and print one JSON object per job (JSON Lines) on stdout.
 Fields a board did not give are left out.
 Default: 5 jobs from each of 4 boards; --site picks boards, -n sets the count.
+With --merge, records of the same job from different boards become one entity
+that keeps every source record in sources; --expand prints those records
+instead of the entities.
 Errors and warnings go to stderr.
 
 examples:
   jobspy "software engineer" --site indeed,linkedin --location Chicago -n 20
   jobspy nurse --site indeed,linkedin --hours-old 24 -o jobs.jsonl
   jobspy "data analyst" --remote --fields title,company,job_url
+  jobspy "data engineer" --merge --site linkedin,indeed,google -n 50
+  jobspy "data engineer" --merge --expand --fields site,id,job_url
 
 exit codes:
   0    at least one board answered, also with no jobs
@@ -58,8 +65,9 @@ EPILOG = "\n".join(
         listing("default fields", PREVIEW),
         listing(
             "other fields (--fields takes any of these, or all)",
-            [f for f in FIELDS if f not in PREVIEW],
+            [f for f in FIELDS if f not in PREVIEW and f not in MERGE_FIELDS],
         ),
+        listing("merge fields (--merge)", MERGE_FIELDS),
     ]
 )
 
@@ -128,6 +136,29 @@ def parser() -> argparse.ArgumentParser:
         help="comma list (default: see board names below)",
     )
     add(
+        "--merge",
+        dest="merge_duplicates",
+        action="store_true",
+        help="merge the same job from several boards into one entity",
+    )
+    add(
+        "--source-priority",
+        type=commas,
+        metavar="LIST",
+        help="sites, best first, whose values win a merge conflict",
+    )
+    add(
+        "--max-results",
+        type=int,
+        metavar="N",
+        help="cap the merged entities (the unified count), not the sources",
+    )
+    add(
+        "--expand",
+        action="store_true",
+        help="with --merge, print each source record instead of the entity",
+    )
+    add(
         "--fetch-description",
         action="store_true",
         help="fetch each job's page (one request per job)",
@@ -173,6 +204,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     args = vars(p.parse_args(argv))
     names, output = args.pop("fields", PREVIEW), args.pop("output", None)
+    expand = args.pop("expand", False)
+    if expand and not args.get("merge_duplicates", False):
+        p.error("--expand needs --merge")
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(encoding="utf-8")
     logging.basicConfig(format="%(levelname)s: %(name)s: %(message)s")
@@ -187,6 +221,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         except OSError as error:
             p.error(f"cannot write {output}: {error.strerror or error}")
         print(f"saved {len(jobs)} jobs to {output}", file=sys.stderr)
+    if expand:
+        jobs = expand_frame(jobs)
     try:
         sys.stdout.writelines(lines(jobs, names))
         sys.stdout.flush()

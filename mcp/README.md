@@ -32,7 +32,7 @@ claude mcp add jobspy -- uvx mcp-jobspy@latest
 
 ## Tools
 
-- `search_jobs` searches the boards and returns a preview of each job with a search id. It takes JobSpy's search options (keywords, location, boards, number per board, posting age, remote, job type and more) and can save every record to a `.csv`, `.json` or `.jsonl` file.
+- `search_jobs` searches the boards and returns a preview of each job with a search id. It takes JobSpy's search options (keywords, location, boards, number per board, posting age, remote, job type and more) and can save every record to a `.csv`, `.json` or `.jsonl` file. With `merge_duplicates=True` one entity stands for the same job on several boards (`entity_count` is the unified count) and `get_job_details` returns its `sources` and `provenance`; `max_results` caps the entities, and `expand=True` returns each board's record instead.
 - `get_job_details` returns the full records of chosen jobs from a search, without searching again.
 
 ## Proxies
