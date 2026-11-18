@@ -3,7 +3,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import get_args
 
@@ -27,6 +27,7 @@ from jobspy.model import (
     Site,
 )
 from jobspy.naukri import Naukri
+from jobspy.posted import UncertainPolicy
 from jobspy.util import (
     configure_logging,
 )
@@ -53,6 +54,7 @@ column_types = {
         int: "int64",
         bool: "bool",
         date: "object",
+        datetime: "object",
     }.get((get_args(field.annotation) or (field.annotation,))[0], "str")
     for name, field in JobPost.model_fields.items()
 }
@@ -76,6 +78,8 @@ def scrape_jobs(
     linkedin_company_ids: Iterable[int] | None = None,
     offset: int | None = 0,
     hours_old: int | None = None,
+    hours_old_uncertain: str | UncertainPolicy | None = None,
+    reference_time: datetime | str | None = None,
     enforce_annual_salary: bool | None = False,
     verbose: int | None = 1,
     user_agent: str | None = None,
@@ -85,6 +89,12 @@ def scrape_jobs(
     Scrapes job data from job boards concurrently
     :param linkedin_fetch_description: Deprecated since 1.2.0: use fetch_description;
         will be removed in 2.0.
+    :param hours_old_uncertain: "include" (default) counts jobs whose posting time
+        may be within hours_old towards results_wanted; "exclude" counts only
+        jobs definitely within it
+    :param reference_time: the fixed "now" of this run that relative ages like
+        "2 days ago" resolve against (default: the moment of this call); pass a
+        previous run's jobs.attrs["reference_time"] to replay it identically
     :return: Pandas DataFrame containing job data
     :raises ValueError: an argument is invalid
     """
@@ -143,5 +153,6 @@ def scrape_jobs(
     jobs_df.attrs = {
         "errors": {site: s.error for site, s, _ in results if s.error},
         "warnings": {site: s.warnings for site, s, _ in results if s.warnings},
+        "reference_time": scraper_input.reference_time,
     }
     return jobs_df

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from curl_cffi.requests import Response
@@ -31,6 +30,7 @@ from jobspy.model import (
     Scraper,
     ScraperInput,
 )
+from jobspy.posted import PostedTime
 from jobspy.util import (
     TLSRotating,
     check_status,
@@ -179,9 +179,13 @@ class Glassdoor(Scraper):
     def _process_job(self, raw: dict[str, object]) -> JobPost | None:
         job = JobView.model_validate(raw)
         header = job.header
-        age = header.ageInDays
-        hours_old = self.scraper_input.hours_old
-        if hours_old and age >= math.ceil(hours_old / 24):
+        posted = PostedTime.ago(
+            header.ageInDays,
+            "day",
+            self.scraper_input.reference_time,
+            raw=str(header.ageInDays),
+        )
+        if not self.scraper_input.keeps(posted):
             return None
 
         job_id = job.listingId
@@ -207,7 +211,7 @@ class Glassdoor(Scraper):
             company_logo=company.squareLogoUrl,
             location=self._parse_location(header, job.country),
             job_url=f"{self.base_url}/job-listing/j?jl={job_id}",
-            date_posted=datetime.now(timezone.utc).date() - timedelta(days=age),
+            **posted.fields(),
             job_type=job_types or None,
             is_remote="WORK_FROM_HOME" in (header.remoteWorkTypes or [])
             or header.locationName == "Remote",

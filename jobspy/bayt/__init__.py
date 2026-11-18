@@ -4,6 +4,7 @@ import json
 import random
 import re
 import time
+from datetime import datetime, timezone
 from itertools import takewhile
 from urllib.parse import quote, urlencode, urljoin
 
@@ -25,12 +26,12 @@ from jobspy.model import (
     Scraper,
     ScraperInput,
 )
+from jobspy.posted import Freshness, PostedTime, fields_of
 from jobspy.util import (
     TLSRotating,
     check_status,
     create_session,
     description_fields,
-    utc_date,
 )
 
 
@@ -50,8 +51,6 @@ class Bayt(Scraper):
         if job_type and job_type not in job_type_codes:
             self.warn(f"job_type {job_type.value} isn't supported, ignoring it")
         self.country, self.city = self._location(scraper_input.location)
-        hours_old = scraper_input.hours_old
-        oldest = time.time() - hours_old * 3600 if hours_old else 0
         job_list: list[JobPost] = []
         seen: set[object] = set()
         first_page = page = scraper_input.offset // jobs_per_page + 1
@@ -72,7 +71,13 @@ class Bayt(Scraper):
                 break
             seen.update(card.get("data-job-id") for card in cards)
             new = list(
-                takewhile(lambda c: (self._timestamp(c) or oldest) >= oldest, cards)
+                takewhile(
+                    lambda c: (
+                        scraper_input.freshness(self._posted(c))
+                        is not Freshness.EXPIRED
+                    ),
+                    cards,
+                )
             )
             if new and scraper_input.is_remote and self.hybrid_ids is None:
                 self.hybrid_ids = self._fetch_hybrid_ids()
@@ -178,10 +183,14 @@ class Bayt(Scraper):
             time.sleep(random.uniform(*self.delay))
 
     @staticmethod
-    def _timestamp(job: Tag) -> int | None:
+    def _posted(job: Tag) -> PostedTime | None:
         posted = job.select_one("[data-automation-jobactivedate]")
         stamp = posted.get("data-automation-jobactivedate", "") if posted else ""
-        return int(stamp) if isinstance(stamp, str) and stamp.isdecimal() else None
+        if isinstance(stamp, str) and stamp.isdecimal():
+            return PostedTime.at(
+                datetime.fromtimestamp(int(stamp), timezone.utc), raw=stamp
+            )
+        return None
 
     def _process_job(self, job: Tag) -> JobPost | None:
         link = job.select_one("h2 a[href]")
@@ -239,7 +248,7 @@ class Bayt(Scraper):
                 country=parts[-1] if parts else None,
             ),
             job_url=job_url,
-            date_posted=utc_date(self._timestamp(job)),
+            **fields_of(self._posted(job)),
             is_remote=is_remote,
             job_level=next(
                 (part.lower() for part in level if "Experience" not in part), None

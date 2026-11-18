@@ -4,7 +4,7 @@ import json
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup, Tag
@@ -29,12 +29,12 @@ from jobspy.model import (
     Scraper,
     ScraperInput,
 )
+from jobspy.posted import PostedTime, Precision, fields_of
 from jobspy.util import (
     TLSRotating,
     check_status,
     create_session,
     description_fields,
-    utc_date,
 )
 
 
@@ -129,14 +129,23 @@ class HelloWork(Scraper):
         }
 
     @staticmethod
-    def _hours_old(age: str) -> int | None:
-        """ "il y a 3 heures" -> 3, "il y a 2 jours" -> 48; None when the card gives no age"""
+    def _posted(age: str, reference: datetime) -> PostedTime | None:
+        """ "il y a 3 heures" -> 3 hours before reference; None when the card gives no age"""
         if age == "moins d'une heure":
-            return 0
-        match = re.fullmatch(r"il y a (\d+) (heure|jour)s?", age)
+            return PostedTime(
+                Precision.RELATIVE, reference - timedelta(hours=1), reference, age
+            )
+        match = re.fullmatch(r"il y a (\d+) (heure|jour|semaine|mois|an)s?", age)
         if not match:
             return None
-        return int(match[1]) * (24 if match[2] == "jour" else 1)
+        unit = {
+            "heure": "hour",
+            "jour": "day",
+            "semaine": "week",
+            "mois": "month",
+            "an": "year",
+        }[match[2]]
+        return PostedTime.ago(int(match[1]), unit, reference, raw=age)
 
     def _process_job(self, card: Tag) -> JobPost | None:
         analytics = card.select_one("div[data-cy=serpCard]")
@@ -144,9 +153,11 @@ class HelloWork(Scraper):
             raise ValueError("no card data")
         if related_list in analytics["data-analytics-values-param"]:
             return None
-        hours = self._hours_old(card.find_all("div")[-1].get_text(strip=True))
-        hours_old = self.scraper_input.hours_old
-        if hours_old and (hours or 0) >= hours_old:
+        posted = self._posted(
+            card.find_all("div")[-1].get_text(strip=True),
+            self.scraper_input.reference_time,
+        )
+        if not self.scraper_input.keeps(posted):
             return None
 
         job_id = str(card["data-id-storage-item-id"])
@@ -179,9 +190,7 @@ class HelloWork(Scraper):
             company="".join(company) or None,
             location=self._parse_location(location.get_text(strip=True)),
             job_url=f"{self.base_url}{link['href']}",
-            date_posted=(
-                utc_date(time.time() - hours * 3600) if hours is not None else None
-            ),
+            **fields_of(posted),
             job_type=job_types or None,
             is_remote="Télétravail complet" in label,
             **salary.model_dump(),
@@ -254,10 +263,13 @@ class HelloWork(Scraper):
                 html = str(section) if section else None
             details = description_fields(html, self.scraper_input.description_format)
             if posting.datePosted:
-                posted = datetime.fromisoformat(posting.datePosted.rstrip("Z"))
-                posted = posted.replace(tzinfo=ZoneInfo(paris_time))
-                posted = posted.astimezone(timezone.utc)
-                details["date_posted"] = posted.date()
+                moment = datetime.fromisoformat(posting.datePosted.rstrip("Z"))
+                moment = moment.replace(tzinfo=ZoneInfo(paris_time))
+                details.update(
+                    PostedTime.at(
+                        moment, raw=posting.datePosted, zone=paris_time
+                    ).fields()
+                )
             experience = next(
                 (
                     text.removeprefix("Exp. ")

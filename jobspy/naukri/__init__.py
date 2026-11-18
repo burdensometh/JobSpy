@@ -4,7 +4,7 @@ import math
 import random
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from jobspy.model import (
     Compensation,
@@ -27,14 +27,13 @@ from jobspy.naukri.constant import (
 )
 from jobspy.naukri.model import Job, JobDetails, JobSearch, Row, Salary, Shared
 from jobspy.naukri.util import generate_nkparam
+from jobspy.posted import Freshness, PostedTime
 from jobspy.util import (
     TLSRotating,
     check_status,
     create_session,
     description_fields,
     plain_converter,
-    too_old,
-    utc_date,
 )
 
 
@@ -86,10 +85,16 @@ class Naukri(Scraper):
             fresh = False
             for job in new_jobs[skip if page == first_page else 0 :]:
                 try:
-                    posted = Row.model_validate(job).createdDate / 1000
-                    if too_old(posted, scraper_input.hours_old):
+                    row = Row.model_validate(job)
+                    posted = PostedTime.at(
+                        datetime.fromtimestamp(row.createdDate / 1000, timezone.utc),
+                        raw=str(row.createdDate),
+                    )
+                    if scraper_input.freshness(posted) is Freshness.EXPIRED:
                         continue
                     fresh = True
+                    if not scraper_input.keeps(posted):
+                        continue
                     job_post = self._process_job(job)
                 except Exception as e:
                     self.log.warning(f"skipping job: {e}")
@@ -126,13 +131,18 @@ class Naukri(Scraper):
             return None
 
         job_id = job.jobId
-        posted = job.createdDate / 1000
+        posted = PostedTime.at(
+            datetime.fromtimestamp(job.createdDate / 1000, timezone.utc),
+            raw=str(job.createdDate),
+        )
         details = self._shared_fields(job)
         if self.scraper_input.fetch_description:
-            posted, page = self._fetch_details(job_id) or (posted, {})
-            if too_old(posted, self.scraper_input.hours_old):
+            fetched = self._fetch_details(job_id)
+            if fetched:
+                posted, page = fetched
+                details |= {name: value for name, value in page.items() if value}
+            if not self.scraper_input.keeps(posted):
                 return None
-            details |= {name: value for name, value in page.items() if value}
 
         labels = {label.type: label.label for label in job.placeholders}
         # e.g. "Hybrid - Pune, Bengaluru", "Remote", "India"
@@ -150,7 +160,7 @@ class Naukri(Scraper):
                 country=Country.INDIA,
             ),
             job_url=self.base_url + job.jdURL,
-            date_posted=utc_date(posted),
+            **posted.fields(),
             is_remote=work_mode == "Remote",
             work_from_home_type=work_mode or "Work from office",
             **self._parse_salary(job.salaryDetail, labels["salary"]).model_dump(),
@@ -198,7 +208,9 @@ class Naukri(Scraper):
             )
         return Compensation()
 
-    def _fetch_details(self, job_id: str) -> tuple[float, dict[str, object]] | None:
+    def _fetch_details(
+        self, job_id: str
+    ) -> tuple[PostedTime, dict[str, object]] | None:
         try:
             response = self.session.get(
                 f"{self.job_page_url}/{job_id}",
@@ -208,7 +220,8 @@ class Naukri(Scraper):
                 raise ValueError("response status code 406: rate limited")
             check_status(response)
             job = JobDetails.model_validate(response.json()["jobDetails"])
-            posted = datetime.strptime(job.createdDate, "%Y-%m-%d %H:%M:%S")
+            moment = datetime.strptime(job.createdDate, "%Y-%m-%d %H:%M:%S")
+            moment = moment.replace(tzinfo=india_time)
             fields = description_fields(
                 job.description, self.scraper_input.description_format
             )
@@ -219,7 +232,8 @@ class Naukri(Scraper):
                 "company_description": plain_converter(job.details),
                 "company_addresses": job.address or None,
             }
-            return posted.replace(tzinfo=india_time).timestamp(), details
+            posted = PostedTime.at(moment, raw=job.createdDate, zone=str(india_time))
+            return posted, details
         except Exception as e:
             self.log.warning(f"job {job_id}: {e}")
             return None

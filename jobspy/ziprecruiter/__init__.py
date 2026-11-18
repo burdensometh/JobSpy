@@ -13,13 +13,13 @@ from jobspy.model import (
     Scraper,
     ScraperInput,
 )
+from jobspy.posted import PostedTime
 from jobspy.util import (
     TLSRotating,
     check_status,
     create_session,
     description_fields,
     get_enum_from_job_type,
-    too_old,
 )
 from jobspy.ziprecruiter.constant import (
     job_type_codes,
@@ -28,6 +28,17 @@ from jobspy.ziprecruiter.constant import (
 )
 from jobspy.ziprecruiter.model import EmploymentType, Job, JobDetails, JobSearch, Pay
 from jobspy.ziprecruiter.util import direct_url, page_values
+
+
+def _posted_stamp(raw: object) -> str | None:
+    """The board's own postedAtUtc value: epoch seconds or an ISO string."""
+    if not isinstance(raw, dict):
+        return None
+    status = raw.get("status")
+    stamp = status.get("postedAtUtc") if isinstance(status, dict) else None
+    if isinstance(stamp, dict):
+        stamp = stamp.get("seconds")
+    return str(stamp) if stamp is not None else None
 
 
 class ZipRecruiter(Scraper):
@@ -107,8 +118,8 @@ class ZipRecruiter(Scraper):
 
     def _process_job(self, raw: object) -> JobPost | None:
         job = Job.model_validate(raw)
-        posted = job.postedAtUtc
-        if too_old(posted.timestamp(), self.scraper_input.hours_old):
+        posted = PostedTime.at(job.postedAtUtc, raw=_posted_stamp(raw))
+        if not self.scraper_input.keeps(posted):
             return None
         job_type = self._parse_job_type(job.employmentTypes)
         if self.scraper_input.job_type == JobType.INTERNSHIP and (
@@ -127,7 +138,7 @@ class ZipRecruiter(Scraper):
             location=Location(city=job.city, state=job.stateCode, country=country),
             job_url=self.base_url + job.rawCanonicalZipJobPageUrl,
             job_url_direct=direct_url(apply_url) if apply_url else None,
-            date_posted=posted.date(),
+            **posted.fields(),
             job_type=job_type,
             # REMOTE or REMOTE_OPTIONAL
             is_remote=any("REMOTE" in t.name for t in job.locationTypes),

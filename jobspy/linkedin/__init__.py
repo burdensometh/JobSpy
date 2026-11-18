@@ -32,6 +32,7 @@ from jobspy.model import (
     ScraperInput,
     annual_factor,
 )
+from jobspy.posted import PostedTime, fields_of
 from jobspy.util import (
     RequestsRotating,
     check_status,
@@ -141,12 +142,12 @@ class LinkedIn(Scraper):
             raise ValueError("no location")
         location = parse_location(location_tag.text.strip())
         time_tag = job_card.find("time")
+        raw = time_tag.get("datetime") if time_tag else None
         try:
-            date_posted = (
-                date.fromisoformat(str(time_tag["datetime"])) if time_tag else None
-            )
-        except (TypeError, KeyError, ValueError):
-            date_posted = None
+            day = date.fromisoformat(str(raw)) if raw else None
+        except ValueError:
+            day = None
+        posted = PostedTime.on(day, raw=str(raw)) if day else None
         job_details = (
             self._fetch_details(job_id) if self.scraper_input.fetch_description else {}
         )
@@ -160,7 +161,7 @@ class LinkedIn(Scraper):
             else None,
             location=location,
             is_remote=is_job_remote(title, location),
-            date_posted=date_posted,
+            **fields_of(posted),
             job_url=f"{self.base_url}/jobs/view/{job_id}",
         ).model_copy(update=job_details)
 

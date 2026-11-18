@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from datetime import date
+from datetime import date, datetime, timezone
 from enum import Enum
 
 from pydantic import (
@@ -13,6 +13,14 @@ from pydantic import (
     field_validator,
     model_serializer,
     model_validator,
+)
+
+from jobspy.posted import (
+    Freshness,
+    PostedTime,
+    Precision,
+    UncertainPolicy,
+    freshness_of,
 )
 
 
@@ -163,6 +171,11 @@ class JobPost(BaseModel):
     company: str | None = None
     location: Location | None = None
     date_posted: date | None = None
+    posted_precision: Precision | None = None
+    posted_raw: str | None = None
+    posted_timezone: str | None = None
+    posted_earliest: datetime | None = None
+    posted_latest: datetime | None = None
     job_type: list[JobType] | None = None
     salary_source: str | None = None
     interval: CompensationInterval | None = None
@@ -262,6 +275,10 @@ class ScraperInput(BaseModel):
 
     results_wanted: int = Field(15, ge=1)
     hours_old: int | None = Field(None, ge=0)
+    hours_old_uncertain: UncertainPolicy = UncertainPolicy.INCLUDE
+    reference_time: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    """The fixed "now" of this run that relative ages like "2 days ago" resolve
+    against; reusing it makes re-parsing the same responses deterministic."""
     enforce_annual_salary: bool = False
     proxies: list[str] = []
     ca_cert: FilePath | None = None
@@ -273,11 +290,30 @@ class ScraperInput(BaseModel):
     def _one_or_several(cls, value: object) -> object:
         return [value] if isinstance(value, (str, Enum)) else value
 
+    @field_validator("reference_time", mode="before")
+    @classmethod
+    def _aware_reference(cls, value: object) -> object:
+        if isinstance(value, datetime) and value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
     @model_validator(mode="after")
     def _merge_linkedin_fetch_description(self) -> ScraperInput:
         if self.linkedin_fetch_description:
             self.fetch_description = True
         return self
+
+    def freshness(self, posted: PostedTime | None) -> Freshness:
+        """How this run's hours_old filter sees a posting time."""
+        return freshness_of(posted, self.hours_old, self.reference_time)
+
+    def keeps(self, posted: PostedTime | None) -> bool:
+        """Whether a posting time passes hours_old and counts towards results_wanted."""
+        verdict = self.freshness(posted)
+        return verdict is Freshness.FRESH or (
+            verdict is Freshness.UNCERTAIN
+            and self.hours_old_uncertain is UncertainPolicy.INCLUDE
+        )
 
 
 class Scraper(ABC):

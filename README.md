@@ -135,8 +135,19 @@ Optional
 |    skips that many results (e.g. 25 skips the first 25 and starts from the 26th)
 │
 ├── hours_old (int): 
-|    filters jobs by the number of hours since the job was posted 
-|    (Glassdoor filters by whole days, so it rounds up to the next day.)
+|    filters jobs by the number of hours since the job was posted.
+|    Boards that give only a date or a relative age like "2 days ago" can't be
+|    judged exactly: each job is definitely fresh, definitely too old, or
+|    uncertain (see hours_old_uncertain)
+│
+├── hours_old_uncertain (str): 
+|    include (default) or exclude: whether jobs whose posting time may be within
+|    hours_old count towards results_wanted
+│
+├── reference_time (datetime): 
+|    the fixed "now" of the run that relative ages like "2 days ago" resolve
+|    against (default: the moment of the call). Pass a previous run's
+|    jobs.attrs["reference_time"] to replay the same responses identically
 │
 ├── verbose (int) {0, 1, 2}: 
 |    Controls the verbosity of the runtime printouts 
@@ -219,6 +230,11 @@ HelloWork searches France. `location` takes a French city, postcode or region, e
 ## Notes
 * Indeed is the best scraper currently with no rate limiting.  
 * Indeed's `date_posted` is the day a job was added to Indeed, the same date `hours_old` filters on.  
+* `date_posted` is only as precise as the board's own data: an exact timestamp keeps its
+  instant, a bare date stays a date, and a relative age like "2 days ago" leaves it empty
+  rather than invent one. The `posted_*` fields keep the board's original text, its
+  timezone and the UTC interval the posting moment falls in, all resolved against the
+  run's fixed `reference_time`.  
 * Most job board endpoints are capped at around 1000 jobs on a given search.  
 * LinkedIn rate limits bursts of requests with a 429, which clears within about a minute. Use proxies for larger searches.
 * Glassdoor rate limits above about 2 requests a second.
@@ -276,6 +292,11 @@ JobPost
 ├── company
 ├── location
 ├── date_posted
+├── posted_precision: instant, day, relative
+├── posted_raw
+├── posted_timezone
+├── posted_earliest
+├── posted_latest
 ├── job_type: fulltime, parttime, internship, contract, temporary, ...
 ├── salary_source: direct_data, description (parsed from posting)
 ├── interval: yearly, monthly, weekly, daily, hourly

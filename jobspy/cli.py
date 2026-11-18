@@ -114,6 +114,13 @@ def parser() -> argparse.ArgumentParser:
     add("--remote", dest="is_remote", action="store_true", help="remote jobs only")
     add("--job-type", metavar="T", help="one of the job types below")
     add("--hours-old", metavar="N", help="posted in the last N hours")
+    add(
+        "--hours-old-uncertain",
+        choices=["include", "exclude"],
+        metavar="POLICY",
+        help="include (default) or exclude jobs whose posting time "
+        "may be within --hours-old",
+    )
     add("--easy-apply", action="store_true", help="jobs hosted on the board")
     add("--country-indeed", metavar="C", help="Indeed and Glassdoor (default usa)")
     add("-n", "--results-wanted", metavar="N", default=5, help="per board (default 5)")

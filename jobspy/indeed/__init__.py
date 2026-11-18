@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from jobspy.indeed.constant import (
@@ -27,12 +28,12 @@ from jobspy.model import (
     Scraper,
     ScraperInput,
 )
+from jobspy.posted import PostedTime
 from jobspy.util import (
     RequestsRotating,
     check_status,
     create_session,
     description_fields,
-    utc_date,
 )
 
 
@@ -184,7 +185,10 @@ class Indeed(Scraper):
             ),
             job_type=get_job_type(job.attributes, self.scraper_input.country_indeed),
             **get_compensation(job.compensation).model_dump(),
-            date_posted=utc_date(job.dateOnIndeed / 1000),
+            **PostedTime.at(
+                datetime.fromtimestamp(job.dateOnIndeed / 1000, timezone.utc),
+                raw=str(job.dateOnIndeed),
+            ).fields(),
             job_url=f"{self.base_url}/viewjob?jk={job.key}",
             job_url_direct=apply_url,
             is_remote=is_job_remote(job.attributes),

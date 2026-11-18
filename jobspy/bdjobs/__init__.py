@@ -25,12 +25,12 @@ from jobspy.model import (
     Scraper,
     ScraperInput,
 )
+from jobspy.posted import PostedTime
 from jobspy.util import (
     RequestsRotating,
     check_status,
     create_session,
     description_fields,
-    too_old,
 )
 
 
@@ -118,8 +118,11 @@ class BDJobs(Scraper):
 
     def _process_job(self, raw: dict[str, object]) -> JobPost | None:
         job = Job.model_validate(raw)
-        posted = datetime.fromisoformat(job.publishDate.replace("Z", "+00:00"))
-        if too_old(posted.timestamp(), self.scraper_input.hours_old):
+        posted = PostedTime.at(
+            datetime.fromisoformat(job.publishDate.replace("Z", "+00:00")),
+            raw=job.publishDate,
+        )
+        if not self.scraper_input.keeps(posted):
             return None
         is_remote = job.WorkPlace == "Home"
         if self.scraper_input.is_remote and not is_remote:
@@ -136,7 +139,7 @@ class BDJobs(Scraper):
             company=job.companyName,
             location=Location(city=city or None, country="Bangladesh"),
             job_url=f"{self.base_url}/h/details/{job_id}",
-            date_posted=posted.date(),
+            **posted.fields(),
             job_type=self._parse_job_type(job.JobType),
             is_remote=is_remote,
             **self._parse_salary(job.Salary).model_dump(),

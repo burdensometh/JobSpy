@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import logging
 import re
-import time
-from datetime import date, datetime, timezone
 from itertools import cycle
 from typing import Any, TypeVar
 
@@ -143,15 +141,6 @@ def description_fields(
         "description": description or None,
         "emails": extract_emails_from_text(html),
     }
-
-
-def utc_date(epoch: float | None) -> date | None:
-    """The UTC date of a Unix time in seconds; None for a missing or zero one."""
-    return datetime.fromtimestamp(epoch, timezone.utc).date() if epoch else None
-
-
-def too_old(posted: float, hours_old: int | None) -> bool:
-    return bool(hours_old and posted and posted < time.time() - hours_old * 3600)
 
 
 def get_enum_from_job_type(job_type_str: str) -> JobType | None:

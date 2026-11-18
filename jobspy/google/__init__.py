@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import re
-from datetime import datetime, timedelta
 from typing import Any
 
 from jobspy.google.constant import async_param, headers_initial, headers_jobs
@@ -15,6 +14,7 @@ from jobspy.model import (
     Scraper,
     ScraperInput,
 )
+from jobspy.posted import PostedTime, fields_of
 from jobspy.util import RequestsRotating, create_session, extract_emails_from_text
 
 
@@ -182,16 +182,13 @@ class Google(Scraper):
         title = job_info[0]
         company_name = job_info[1]
         location = city = job_info[2]
-        state = country = date_posted = None
+        state = country = None
         if location and "," in location:
             city, state, *country = [*map(lambda x: x.strip(), location.split(","))]
 
-        days_ago_str = job_info[12]
-        if isinstance(days_ago_str, str):
-            match = re.search(r"\d+", days_ago_str)
-            if match:
-                days_ago = int(match.group())
-                date_posted = (datetime.now() - timedelta(days=days_ago)).date()
+        posted = PostedTime.parse_relative(
+            job_info[12], self.scraper_input.reference_time
+        )
 
         description = job_info[19]
         text = (description or "").lower()
@@ -204,7 +201,7 @@ class Google(Scraper):
                 city=city, state=state, country=country[0] if country else None
             ),
             job_url=job_url,
-            date_posted=date_posted,
+            **fields_of(posted),
             is_remote="remote" in text or "wfh" in text,
             description=description,
             emails=extract_emails_from_text(description),
